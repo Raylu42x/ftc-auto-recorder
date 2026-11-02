@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plan Viewer</title>
+<style>
+:root { --bg:#f6f7f8; --panel:#fff; --ink:#1c2126; --muted:#667; --line:#d8dde2; --tile:#eceff1; --tile-line:#d5dade;
+        --red:#d9423a; --blue:#2f7ed8; --accent:#2e7d32; --path:#1c2126; --shoot:#e8590c; }
+@media (prefers-color-scheme: dark) { :root { --bg:#14171a; --panel:#1e2327; --ink:#e8ebee; --muted:#9aa5ae; --line:#333b42;
+        --tile:#262c31; --tile-line:#333b42; --path:#e8ebee; } }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.4 -apple-system,system-ui,sans-serif; }
+header { padding:14px 16px 0; display:flex; flex-wrap:wrap; gap:8px 14px; align-items:baseline; }
+h1 { font-size:20px; margin:0; }
+main { display:grid; grid-template-columns:minmax(0,1fr) 340px; gap:14px; padding:14px 16px; max-width:1200px; }
+@media (max-width:860px) { main { grid-template-columns:minmax(0,1fr); } }
+.panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; min-width:0; }
+canvas { display:block; width:100%; max-width:720px; margin:0 auto; aspect-ratio:1; touch-action:none; cursor:grab; }
+button,select { font:inherit; color:inherit; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:6px 10px; cursor:pointer; }
+select { max-width:100%; width:100%; }
+.row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:8px 0; }
+input[type=range] { flex:1; min-width:120px; }
+.muted { color:var(--muted); font-size:13px; }
+#drop { border:2px dashed var(--line); border-radius:8px; padding:12px; text-align:center; cursor:pointer; }
+#drop.over { border-color:var(--accent); }
+#events { list-style:none; margin:0; padding:0; max-height:330px; overflow:auto; font-size:13px; }
+#events li { display:flex; gap:8px; padding:3px 4px; border-radius:4px; cursor:pointer; }
+#events li.now { background:var(--tile); font-weight:600; }
+#events time { color:var(--muted); min-width:44px; font-variant-numeric:tabular-nums; }
+.stat { font-variant-numeric:tabular-nums; }
+.warn { color:var(--shoot); font-size:13px; }
+h2 { font-size:14px; margin:12px 0 4px; }
+</style>
+</head>
+<body>
+<header><h1>Plan Viewer</h1><span class="muted">See a recorded plan on the field. Nothing leaves this page.</span></header>
+<main>
+<section class="panel">
+  <canvas id="field" width="1000" height="1000" aria-label="Field map showing the plan's path"></canvas>
+  <div class="row">
+    <button id="play">Play</button>
+    <input id="time" type="range" min="0" max="1" step="0.01" value="0" aria-label="Time in the plan">
+    <span id="clock" class="stat">0.0 s</span>
+    <select id="speed" style="width:auto" aria-label="Play speed"><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select>
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="blue"> Turn field 180°</label>
+    <label><input type="checkbox" id="mirror"> Mirror plan</label>
+    <label class="muted">Field image <input type="file" id="image" accept="image/*"></label>
+    <label class="muted">Robot <input type="number" id="robot" value="18" min="6" max="24" style="width:4em"> in</label>
+    <span class="muted">Drag the robot at time 0 to where it starts, facing the way the arrow shows.</span>
+  </div>
+</section>
+<aside class="panel">
+  <div id="drop" tabindex="0" role="button">Drop plan .txt files here, or click to choose<br>
+    <span class="muted">Pull them from the hub with tools/plans.sh</span></div>
+  <input id="file" type="file" accept=".txt" multiple hidden>
+  <h2>Plan</h2>
+  <select id="plans" aria-label="Plan"></select>
+  <p id="info" class="muted"></p>
+  <p id="warn" class="warn"></p>
+  <h2>What happens</h2>
+  <ul id="events"></ul>
+</aside>
+</main>
+<script>
+const FIELD = 144;
+const IMPOSSIBLE_SPEED = 120;   // same as Plan.java: a jump like this is a bad encoder read
+let ROBOT = 18, picture = null;
+
+const $ = id => document.getElementById(id);
+const cv = $('field'), g = cv.getContext('2d');
+let plans = [], plan = null, t = 0, playing = false, last = 0, dragging = false;
+
+function parse(text, file) {
+  const p = {name:null, start:null, path:[], events:[], file, cut:false};
+  for (const raw of text.split('\n')) {
+    const line = raw.trim(), a = line.split(/\s+/);
+    if (line.startsWith('// name ')) p.name = line.slice(8).trim();
+    else if (line.startsWith('// start ')) p.start = a[2];
+        else if (a[0] === 'p' && a.length >= 5) p.path.push([+a[1], +a[2], +a[3], +a[4]]);
+    else if (a[0] === 'e' && a.length >= 3) p.events.push({t:+a[1], name:a[2], value:a[3] || ''});
+  }
+  if (!p.name || !p.path.length) return null;
+  p.events.sort((a,b) => a.t-b.t);
+  // Same clean-up as Plan.tidy, so this shows what the robot will really run.
+  for (let i = 1; i < p.path.length; i++) {
+    const A = p.path[i-1], B = p.path[i];
+    if (Math.hypot(B[1]-A[1], B[2]-A[2]) / Math.max(0.01, B[0]-A[0]) > IMPOSSIBLE_SPEED) { p.path.length = i; p.cut = true; break; }
+  }
+  const end = p.path[p.path.length-1], lastEvent = p.events.length ? p.events[p.events.length-1].t : 0;
+  let keep = p.path.length - 1;
+  while (keep > 0) {
+    const q = p.path[keep-1];
+    if (Math.hypot(q[1]-end[1], q[2]-end[2]) >= 0.25 || Math.abs(q[3]-end[3]) >= 0.02 || q[0] < lastEvent) break;
+    keep--;
+  }
+  p.path.length = keep + 1;
+  p.startPos = [72,72];
+  return p;
+}
+
+const duration = () => plan ? Math.max(plan.path[plan.path.length-1][0], plan.events.length ? plan.events[plan.events.length-1].t : 0) : 0;
+// The plan's heading 0 points up the screen, so its x is up and its y is left. Mirror flips left and right about the start line.
+function toField(s) {
+  const f = plan.path[0], c = Math.cos(f[3]), n = Math.sin(f[3]), dx = s[1]-f[1], dy = s[2]-f[2];
+  if ($('mirror').checked) { const along = dx*c+dy*n, left = dy*c-dx*n; return [plan.startPos[0] + (along*n - left*c) * -1, plan.startPos[1] + along*c + left*n, 2*f[3]-s[3]]; }
+  return [plan.startPos[0] - dy, plan.startPos[1] + dx, s[3]];
+}
+function at(time) {
+  const P = plan.path;
+  let lo = 0, hi = P.length - 1;
+  while (hi - lo > 1) { const m = (lo+hi) >> 1; if (P[m][0] <= time) lo = m; else hi = m; }
+  const A = P[lo], B = P[hi], span = B[0]-A[0], k = span > 0 ? Math.min(1, Math.max(0, (time-A[0])/span)) : 0;
+  return toField([0, A[1]+(B[1]-A[1])*k, A[2]+(B[2]-A[2])*k, A[3]+(B[3]-A[3])*k]);
+}
+
+// "Turn field 180°" shows the other alliance on a field that rotates.
+const S = cv.width / FIELD;
+const isBlue = () => $('blue').checked;
+const px = (x, y) => isBlue() ? [(FIELD-x)*S, y*S] : [x*S, (FIELD-y)*S];
+function box(b, fill, stroke) {
+  const [x0,y0] = px(b[0],b[1]), [x1,y1] = px(b[2],b[3]);
+  g.beginPath(); g.rect(Math.min(x0,x1), Math.min(y0,y1), Math.abs(x1-x0), Math.abs(y1-y0));
+  if (fill) { g.fillStyle = fill; g.fill(); }
+  if (stroke) { g.strokeStyle = stroke; g.lineWidth = 3; g.stroke(); }
+}
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+function dot(x, y, r, color) { const [a,b] = px(x,y); g.beginPath(); g.arc(a,b,r,0,7); g.fillStyle = color; g.fill(); }
+
+function draw() {
+  g.clearRect(0,0,cv.width,cv.height);
+  g.fillStyle = css('--tile'); g.fillRect(0,0,cv.width,cv.height);
+  if (picture) g.drawImage(picture,0,0,cv.width,cv.height);
+  g.strokeStyle = css('--tile-line'); g.lineWidth = 2;
+  for (let i = 24; i < FIELD; i += 24) { g.beginPath(); g.moveTo(i*S,0); g.lineTo(i*S,cv.height); g.moveTo(0,i*S); g.lineTo(cv.width,i*S); g.stroke(); }
+  g.strokeStyle = css('--line'); g.lineWidth = 6; g.strokeRect(0,0,cv.width,cv.height);
+  if (!plan) {
+    g.fillStyle = css('--muted'); g.font = '32px system-ui'; g.textAlign = 'center';
+    g.fillText('Drop a plan file to see it here', cv.width/2, cv.height/2);
+    return;
+  }
+  // Whole path, then the part already driven.
+  const trace = upto => { g.beginPath(); plan.path.forEach((s,i) => { if (s[0] > upto) return; const f = toField(s), [a,b] = px(f[0],f[1]); i ? g.lineTo(a,b) : g.moveTo(a,b); }); g.stroke(); };
+  g.lineJoin = 'round'; g.setLineDash([12,10]); g.strokeStyle = css('--muted'); g.lineWidth = 4; trace(Infinity);
+  g.setLineDash([]); g.strokeStyle = css('--path'); g.lineWidth = 6; trace(t);
+  // Where things happen.
+  plan.events.forEach(e => { const f = at(e.t); dot(f[0],f[1],9,css('--shoot')); });
+  // Robot.
+  const r = at(t), [cx,cy] = px(r[0],r[1]);
+  g.save(); g.translate(cx,cy);
+  // Screen angle of the heading: heading 0 faces +y on the field.
+  const fwd = px(r[0]+Math.sin(-r[2]), r[1]+Math.cos(-r[2]));
+  g.rotate(Math.atan2(fwd[1]-cy, fwd[0]-cx));
+  const h = ROBOT*S/2;
+  g.fillStyle = 'rgba(46,125,50,.28)'; g.strokeStyle = css('--accent'); g.lineWidth = 5;
+  g.fillRect(-h,-h,2*h,2*h); g.strokeRect(-h,-h,2*h,2*h);
+  g.beginPath(); g.moveTo(h+14,0); g.lineTo(h-14,-14); g.lineTo(h-14,14); g.closePath(); g.fillStyle = css('--accent'); g.fill();
+  g.restore();
+}
+
+const words = e => (e.name + ' ' + e.value).trim();
+
+function showPlan() {
+  plan = plans[+$('plans').value] || null;
+  t = 0; playing = false; $('play').textContent = 'Play';
+  const list = $('events'); list.textContent = '';
+  if (!plan) { draw(); return; }
+  $('time').max = duration();
+  let dist = 0;
+  for (let i = 1; i < plan.path.length; i++) dist += Math.hypot(plan.path[i][1]-plan.path[i-1][1], plan.path[i][2]-plan.path[i-1][2]);
+  $('info').textContent = `${duration().toFixed(1)} s · ${Math.round(dist)} in driven · ${plan.events.length} events${plan.start ? ' · start: ' + plan.start : ''}`;
+  const notes = [];
+  if (duration() > 30) notes.push('Longer than the 30 s auto period.');
+  if (plan.cut) notes.push('This file had a bad last point. It was cut off here and on the robot.');
+  $('warn').textContent = notes.join(' ');
+  plan.events.forEach(e => {
+    const li = document.createElement('li');
+    li.dataset.t = e.t;
+    const when = document.createElement('time'), what = document.createElement('span');
+    when.textContent = e.t.toFixed(1) + ' s'; what.textContent = words(e);
+    li.append(when, what);
+    li.onclick = () => { setTime(e.t); };
+    list.append(li);
+  });
+  setTime(0);
+}
+
+function setTime(v) {
+  t = Math.max(0, Math.min(duration(), v));
+  $('time').value = t;
+  $('clock').textContent = t.toFixed(1) + ' s';
+  let now = null;
+  for (const li of $('events').children) { li.classList.remove('now'); if (+li.dataset.t <= t) now = li; }
+  if (now) now.classList.add('now');
+  draw();
+}
+
+function tick(ms) {
+  if (playing) {
+    t += (ms-last)/1000 * +$('speed').value;
+    if (t >= duration()) { playing = false; $('play').textContent = 'Play'; }
+    setTime(t);
+  }
+  last = ms;
+  requestAnimationFrame(tick);
+}
+
+async function addFiles(files) {
+  const bad = [];
+  for (const f of files) {
+    const p = parse(await f.text(), f.name);
+    if (!p) { bad.push(f.name); continue; }
+    const i = plans.findIndex(q => q.file === p.file);
+    if (i >= 0) plans[i] = p; else plans.push(p);
+  }
+  const box = $('plans'); box.textContent = '';
+  plans.forEach((p,i) => { const o = document.createElement('option'); o.value = i; o.textContent = p.name; box.append(o); });
+  if (plans.length) box.value = plans.length - 1;
+  showPlan();
+  if (bad.length) $('warn').textContent = "Couldn't read: " + bad.join(', ');
+}
+
+$('play').onclick = () => {
+  if (!plan) return;
+  if (t >= duration()) setTime(0);
+  playing = !playing; $('play').textContent = playing ? 'Pause' : 'Play';
+};
+$('time').oninput = e => { playing = false; $('play').textContent = 'Play'; setTime(+e.target.value); };
+$('plans').onchange = showPlan;
+$('blue').onchange = draw;
+$('mirror').onchange = draw;
+$('robot').oninput = e => { ROBOT = +e.target.value || 18; draw(); };
+$('image').onchange = e => { const f = e.target.files[0]; if (!f) return; const i = new Image(); i.onload = () => { picture = i; draw(); }; i.src = URL.createObjectURL(f); };
+const drop = $('drop');
+drop.onclick = () => $('file').click();
+drop.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('file').click(); } };
+$('file').onchange = e => addFiles([...e.target.files]);
+['dragover','dragenter'].forEach(n => document.addEventListener(n, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave','drop'].forEach(n => document.addEventListener(n, e => { e.preventDefault(); drop.classList.remove('over'); }));
+document.addEventListener('drop', e => addFiles([...e.dataTransfer.files]));
+function point(e) {
+  const r = cv.getBoundingClientRect(), x = (e.clientX-r.left)/r.width*FIELD, y = (e.clientY-r.top)/r.height*FIELD;
+  return isBlue() ? [FIELD-x, y] : [x, FIELD-y];
+}
+cv.onpointerdown = e => { if (plan && t === 0) { dragging = true; cv.setPointerCapture(e.pointerId); } };
+cv.onpointermove = e => { if (!dragging) return; const [x,y] = point(e); const h = ROBOT/2;
+  plan.startPos = [Math.max(h,Math.min(FIELD-h,x)), Math.max(h,Math.min(FIELD-h,y))];
+  draw(); };
+cv.onpointerup = () => { dragging = false; };
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw);
+draw();
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
